@@ -1,0 +1,23 @@
+{
+  "work_dir": "./work_repo",
+  "log_file": "./logs/git_sync.log",
+
+  "remotes": [
+    { "name": "github", "url": "https://github.com/your-org/your-repo.git" },
+    { "name": "gitlab", "url": "https://gitlab.com/your-org/your-repo.git" },
+    { "name": "office", "url": "ssh://git@git.example.local/your-repo.git" }
+  ],
+
+  "include_branches": ["*"],
+  "exclude_branches": ["dependabot/*", "tmp/*"],
+
+  "sync_tags": false,
+  "on_conflict": "skip",
+
+  "merge_identity": {
+    "name": "git-sync",
+    "email": "git-sync@localhost"
+  },
+
+  "dry_run": false
+}
