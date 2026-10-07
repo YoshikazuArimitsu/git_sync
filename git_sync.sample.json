@@ -19,5 +19,12 @@
     "email": "git-sync@localhost"
   },
 
+  "delete_merged_branches": {
+    "enabled": true,
+    "require_merged": true,
+    "merged_into": ["main", "master", "develop"],
+    "protected_branches": ["main", "master", "develop", "release/*"]
+  },
+
   "dry_run": false
 }

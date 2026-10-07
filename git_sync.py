@@ -12,6 +12,8 @@ git_sync.py - 複数のリモートリポジトリ間でブランチを相互同
        - 履歴が分岐している             → マージコミットを作成
        - マージでコンフリクト            → そのブランチはスキップして報告
   4. 統合結果を全リモートへ push する (強制 push はしない)
+  5. 前回同期時の状態を保存し、次回以降「マージ済みで、どこかのリモートで
+     削除されたブランチ」を検知したら、全リモートから削除する
 
 使い方:
   python git_sync.py                       # 同じフォルダの git_sync.json を使用
@@ -146,7 +148,52 @@ def load_config(path):
     cfg.setdefault("sync_tags", False)
     cfg.setdefault("on_conflict", "skip")      # skip | prefer:<remote名>
     cfg.setdefault("merge_identity", {"name": "git-sync", "email": "git-sync@localhost"})
+
+    d = cfg.get("delete_merged_branches")
+    if not isinstance(d, dict):
+        d = {"enabled": bool(d) if d is not None else True}
+    d.setdefault("enabled", True)
+    d.setdefault("require_merged", True)
+    d.setdefault("merged_into", ["main", "master", "develop"])
+    d.setdefault("protected_branches", ["main", "master", "develop", "release/*"])
+    cfg["delete_merged_branches"] = d
     return cfg
+
+
+# ----------------------------------------------------------------------------
+# 前回同期状態 (削除検知用)
+#   work_dir/.git/git_sync_state.json に {branch: sha} を保存する。
+#   .git 内に置くので、作業ツリーの掃除 (git clean) で消えない。
+# ----------------------------------------------------------------------------
+def state_path(cfg):
+    return os.path.join(cfg["work_dir"], ".git", "git_sync_state.json")
+
+
+def load_state(cfg):
+    p = state_path(cfg)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("remotes") != sorted(r["name"] for r in cfg["remotes"]):
+            # リモート構成が変わったら前回状態は信用しない (誤削除防止)
+            log("リモート構成が前回と異なるため、今回は削除検知を行いません。")
+            return None
+        return data.get("branches", {})
+    except Exception as e:  # 壊れていたら削除検知しない
+        log(f"状態ファイルを読めません ({e})。今回は削除検知を行いません。")
+        return None
+
+
+def save_state(cfg, branches):
+    p = state_path(cfg)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"updated": datetime.datetime.now().isoformat(timespec="seconds"),
+                   "remotes": sorted(r["name"] for r in cfg["remotes"]),
+                   "branches": branches}, f, ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, p)
 
 
 # ----------------------------------------------------------------------------
@@ -212,6 +259,59 @@ def branch_selected(branch, cfg, only):
     if any(fnmatch.fnmatchcase(branch, p) for p in cfg["exclude_branches"]):
         return False
     return True
+
+
+# ----------------------------------------------------------------------------
+# 削除検知
+# ----------------------------------------------------------------------------
+def match_any(name, patterns):
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def check_deletion(git, branch, heads, order, last_sha, per_remote, dcfg):
+    """
+    戻り値: ("delete", 説明) / ("keep", 理由) / (None, None)=削除ではない
+    """
+    if last_sha is None or len(heads) == len(order):
+        return None, None          # 前回未同期 or 全リモートに存在 → 削除ではない
+    missing = [r for r in order if r not in heads]
+
+    if match_any(branch, dcfg["protected_branches"]) or branch in dcfg["merged_into"]:
+        return "keep", f"保護ブランチのため復元 (削除元: {', '.join(missing)})"
+
+    moved = [r for r, s in heads.items() if s != last_sha]
+    if moved:
+        return "keep", (f"{', '.join(missing)} で削除されたが {', '.join(moved)} で"
+                        f"新しいコミットがあるため復元")
+
+    if dcfg["require_merged"]:
+        merged_to = None
+        for target in dcfg["merged_into"]:
+            if target == branch:
+                continue
+            for r in order:
+                tip = per_remote[r].get(target)
+                if tip and git.is_ancestor(last_sha, tip):
+                    merged_to = f"{r}/{target}"
+                    break
+            if merged_to:
+                break
+        if not merged_to:
+            return "keep", (f"{', '.join(missing)} で削除されたが "
+                            f"{'/'.join(dcfg['merged_into'])} に未マージのため復元")
+        return "delete", f"{', '.join(missing)} で削除 & {merged_to} にマージ済み"
+    return "delete", f"{', '.join(missing)} で削除"
+
+
+def delete_branch(git, remote, branch, sha, dry_run):
+    if dry_run:
+        return True, "(dry-run)"
+    # 削除直前に誰かが push していたら消さない (force-with-lease)
+    p = git.run("push", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{sha}",
+                remote, f":refs/heads/{branch}", check=False)
+    if p.returncode != 0:
+        return False, (p.stderr.strip().splitlines() or ["削除失敗"])[-1]
+    return True, "削除"
 
 
 # ----------------------------------------------------------------------------
@@ -318,22 +418,58 @@ def main():
     log(f"ブランチ数: 全 {len(all_branches)} / 対象 {len(targets)}")
     log("-" * 70)
 
-    stats = {"unchanged": 0, "updated": 0, "conflict": 0, "push_error": 0}
+    dcfg = cfg["delete_merged_branches"]
+    last_state = load_state(cfg) if dcfg["enabled"] else None
+    if dcfg["enabled"] and last_state is None and not os.path.isfile(state_path(cfg)):
+        log("初回実行のため削除検知は次回から有効になります。")
+    new_state = {}
+    # 今回の対象外ブランチの前回状態は引き継ぐ (-b 指定時など)
+    if last_state:
+        new_state = {b: s for b, s in last_state.items() if b not in targets}
+
+    stats = {"unchanged": 0, "updated": 0, "conflict": 0, "push_error": 0, "deleted": 0}
     problems = []
 
     for br in targets:
         heads = {r: per_remote[r][br] for r in order if br in per_remote[r]}
+
+        if last_state is not None:
+            verdict, why = check_deletion(git, br, heads, order, last_state.get(br),
+                                          per_remote, dcfg)
+            if verdict == "delete":
+                log(f"[DELETE]   {br}: {why}")
+                all_ok = True
+                for r in order:
+                    if r not in heads:
+                        continue
+                    ok, msg = delete_branch(git, r, br, heads[r], dry_run)
+                    log(f"             - {r}: {heads[r][:8]} {msg}")
+                    if not ok:
+                        all_ok = False
+                        stats["push_error"] += 1
+                        problems.append(f"{br} → {r}: 削除失敗 ({msg})")
+                if all_ok:
+                    stats["deleted"] += 1
+                else:
+                    new_state[br] = last_state[br]   # 次回再試行
+                continue
+            if verdict == "keep":
+                log(f"[RESTORE]  {br}: {why}")
+
         sha, how = integrate_branch(git, br, heads, order, cfg)
         if sha is None:
             stats["conflict"] += 1
             detail = ", ".join(f"{r}={heads[r][:8]}" for r in heads)
             log(f"[CONFLICT] {br}: 自動マージできません ({detail}) → スキップ")
             problems.append(f"{br}: コンフリクト ({detail})")
+            if last_state and br in last_state:
+                new_state[br] = last_state[br]
             continue
 
         need = [r for r in order if per_remote[r].get(br) != sha]
         if not need:
             stats["unchanged"] += 1
+            new_state[br] = sha
             log(f"[OK]       {br}: 全リモートで一致 ({sha[:8]})")
             continue
 
@@ -347,6 +483,10 @@ def main():
             if not ok:
                 stats["push_error"] += 1
                 problems.append(f"{br} → {r}: push 失敗 ({msg})")
+        if not any(p.startswith(f"{br} → ") for p in problems):
+            new_state[br] = sha
+        elif last_state and br in last_state:
+            new_state[br] = last_state[br]
 
     if cfg["sync_tags"]:
         log("-" * 70)
@@ -365,7 +505,11 @@ def main():
     git.run("checkout", "-q", "--detach", check=False)
 
     log("-" * 70)
+    if dcfg["enabled"] and not dry_run:
+        save_state(cfg, new_state)
+
     log(f"結果: 一致 {stats['unchanged']} / 更新 {stats['updated']} / "
+        f"削除 {stats['deleted']} / "
         f"コンフリクト {stats['conflict']} / push失敗 {stats['push_error']}")
     if problems:
         log("要対応:")
