@@ -1,3 +1,5 @@
 logs/
 work_repo/
 git_sync.json
+.env
+__pycache__/

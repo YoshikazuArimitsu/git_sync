@@ -20,6 +20,10 @@ git_sync.py - 複数のリモートリポジトリ間でブランチを相互同
   python git_sync.py -c other.json         # 設定ファイルを指定
   python git_sync.py --dry-run             # push せずに何が起きるかだけ表示
   python git_sync.py --branch main --branch develop   # 対象ブランチを限定
+
+  設定は 設定ファイル → 環境変数 GIT_SYNC_CONFIG_JSON → 個別の環境変数
+  (GIT_SYNC_REMOTES など) の順に読み込み、後のものが優先される。
+  URL 中の ${VAR} は環境変数で置き換えられる (トークンをファイルに書かないため)。
 """
 
 import argparse
@@ -27,11 +31,19 @@ import datetime
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CONFIG = os.path.join(SCRIPT_DIR, "git_sync.json")
+DEFAULT_CONFIG = os.environ.get("GIT_SYNC_CONFIG") or os.path.join(SCRIPT_DIR, "git_sync.json")
+
+# URL 中の認証情報 (https://user:token@host) をログに出さないためのマスク
+_CRED_RE = re.compile(r"(https?://)[^/@\s]+@")
+
+
+def mask(text):
+    return _CRED_RE.sub(r"\1***@", text)
 
 
 # ----------------------------------------------------------------------------
@@ -46,7 +58,7 @@ class Logger:
             self.fp = open(log_file, "a", encoding="utf-8")
 
     def __call__(self, msg=""):
-        line = msg
+        line = mask(str(msg))
         try:
             print(line, flush=True)
         except UnicodeEncodeError:  # Windows コンソールの文字コード対策
@@ -114,12 +126,131 @@ class Git:
 # ----------------------------------------------------------------------------
 # 設定
 # ----------------------------------------------------------------------------
+_TRUE = {"1", "true", "yes", "on"}
+_FALSE = {"0", "false", "no", "off"}
+
+
+def _env_bool(name):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
+    v = v.strip().lower()
+    if v in _TRUE:
+        return True
+    if v in _FALSE:
+        return False
+    sys.exit(f"設定エラー: 環境変数 {name} は true/false で指定してください: {v}")
+
+
+def _env_list(name):
+    v = os.environ.get(name)
+    if v is None or v.strip() == "":
+        return None
+    return [x.strip() for x in re.split(r"[,\s]+", v) if x.strip()]
+
+
+def _parse_remotes_env(text):
+    """GIT_SYNC_REMOTES="name1=url1,name2=url2" (カンマ・改行・空白区切り)"""
+    remotes = []
+    for item in re.split(r"[,\s]+", text.strip()):
+        if not item:
+            continue
+        if "=" not in item:
+            sys.exit(f"設定エラー: GIT_SYNC_REMOTES は name=url 形式で指定してください: {item}")
+        name, url = item.split("=", 1)
+        remotes.append({"name": name.strip(), "url": url.strip()})
+    return remotes
+
+
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def expand_env(text, where):
+    """${VAR} を環境変数で置換する。未定義ならエラー (トークン入れ忘れ防止)"""
+    def repl(m):
+        v = os.environ.get(m.group(1))
+        if not v:
+            sys.exit(f"設定エラー: {where} で参照している環境変数 {m.group(1)} が未定義(または空)です。")
+        return v
+    return _VAR_RE.sub(repl, text)
+
+
 def load_config(path):
-    if not os.path.isfile(path):
-        sys.exit(f"設定ファイルが見つかりません: {path}\n"
-                 f"git_sync.sample.json をコピーして作成してください。")
-    with open(path, encoding="utf-8-sig") as f:
-        cfg = json.load(f)
+    """
+    設定は次の順に読み込み、後のものほど優先する:
+      1. 設定ファイル (-c / 環境変数 GIT_SYNC_CONFIG / 既定 git_sync.json)
+      2. 環境変数 GIT_SYNC_CONFIG_JSON (JSON 文字列。ファイル内容を丸ごと渡す用)
+      3. 個別の環境変数 GIT_SYNC_REMOTES, GIT_SYNC_DRY_RUN など
+    """
+    cfg = {}
+    sources = []
+    base_dir = os.getcwd()
+
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        sources.append(os.path.abspath(path))
+        base_dir = os.path.dirname(os.path.abspath(path))
+
+    env_json = os.environ.get("GIT_SYNC_CONFIG_JSON")
+    if env_json and env_json.strip():
+        try:
+            extra = json.loads(env_json)
+        except json.JSONDecodeError as e:
+            sys.exit(f"設定エラー: GIT_SYNC_CONFIG_JSON が JSON として不正です: {e}")
+        cfg.update(extra)
+        sources.append("GIT_SYNC_CONFIG_JSON")
+
+    env_over = {}
+    if os.environ.get("GIT_SYNC_REMOTES", "").strip():
+        cfg["remotes"] = _parse_remotes_env(os.environ["GIT_SYNC_REMOTES"])
+        env_over["remotes"] = True
+    for key, env in [("work_dir", "GIT_SYNC_WORK_DIR"), ("log_file", "GIT_SYNC_LOG_FILE"),
+                     ("on_conflict", "GIT_SYNC_ON_CONFLICT")]:
+        if os.environ.get(env, "").strip():
+            cfg[key] = os.environ[env].strip()
+            env_over[key] = True
+    for key, env in [("sync_tags", "GIT_SYNC_SYNC_TAGS"), ("dry_run", "GIT_SYNC_DRY_RUN")]:
+        v = _env_bool(env)
+        if v is not None:
+            cfg[key] = v
+            env_over[key] = True
+    for key, env in [("include_branches", "GIT_SYNC_INCLUDE_BRANCHES"),
+                     ("exclude_branches", "GIT_SYNC_EXCLUDE_BRANCHES")]:
+        v = _env_list(env)
+        if v is not None:
+            cfg[key] = v
+            env_over[key] = True
+    if any(os.environ.get(e, "").strip() for e in
+           ("GIT_SYNC_DELETE_MERGED", "GIT_SYNC_REQUIRE_MERGED")):
+        d = cfg.get("delete_merged_branches")
+        d = dict(d) if isinstance(d, dict) else ({"enabled": bool(d)} if d is not None else {})
+        v = _env_bool("GIT_SYNC_DELETE_MERGED")
+        if v is not None:
+            d["enabled"] = v
+        v = _env_bool("GIT_SYNC_REQUIRE_MERGED")
+        if v is not None:
+            d["require_merged"] = v
+        cfg["delete_merged_branches"] = d
+        env_over["delete_merged_branches"] = True
+    name = os.environ.get("GIT_SYNC_MERGE_NAME", "").strip()
+    email = os.environ.get("GIT_SYNC_MERGE_EMAIL", "").strip()
+    if name or email:
+        mi = dict(cfg.get("merge_identity") or {})
+        if name:
+            mi["name"] = name
+        if email:
+            mi["email"] = email
+        cfg["merge_identity"] = mi
+        env_over["merge_identity"] = True
+    if env_over:
+        sources.append("環境変数(" + ", ".join(env_over) + ")")
+
+    if not sources or "remotes" not in cfg:
+        sys.exit(f"設定が見つかりません (リモートの指定がありません): {path}\n"
+                 f"設定ファイルを用意するか、環境変数 GIT_SYNC_CONFIG_JSON / "
+                 f"GIT_SYNC_REMOTES で設定を渡してください。")
+    cfg["_sources"] = sources
 
     remotes = cfg.get("remotes") or []
     if len(remotes) < 2:
@@ -131,16 +262,19 @@ def load_config(path):
         if r["name"] in names:
             sys.exit(f"設定エラー: リモート名が重複しています: {r['name']}")
         names.add(r["name"])
+        r["url"] = expand_env(r["url"], f"remotes[{r['name']}].url")
 
-    cfg_dir = os.path.dirname(os.path.abspath(path))
+    # 相対パスは「設定ファイルのフォルダ」(ファイルが無ければカレント) 基準
     work_dir = cfg.get("work_dir", "./work_repo")
     if not os.path.isabs(work_dir):
-        work_dir = os.path.join(cfg_dir, work_dir)
+        work_dir = os.path.join(base_dir, work_dir)
     cfg["work_dir"] = os.path.normpath(work_dir)
 
     log_file = cfg.get("log_file")
+    if isinstance(log_file, str) and log_file.strip().lower() in ("", "-", "none", "off"):
+        log_file = None   # 画面 (標準出力) のみ
     if log_file and not os.path.isabs(log_file):
-        log_file = os.path.join(cfg_dir, log_file)
+        log_file = os.path.join(base_dir, log_file)
     cfg["log_file"] = log_file
 
     cfg.setdefault("include_branches", ["*"])
@@ -387,7 +521,8 @@ def push_branch(git, remote, branch, sha, dry_run):
 def main():
     global log
     ap = argparse.ArgumentParser(description="複数リモートリポジトリのブランチ相互同期")
-    ap.add_argument("-c", "--config", default=DEFAULT_CONFIG, help="設定ファイル (JSON)")
+    ap.add_argument("-c", "--config", default=DEFAULT_CONFIG,
+                    help="設定ファイル (JSON)。環境変数 GIT_SYNC_CONFIG でも指定可")
     ap.add_argument("-n", "--dry-run", action="store_true", help="push せずに結果だけ表示")
     ap.add_argument("-b", "--branch", action="append", help="対象ブランチを限定 (複数可)")
     ap.add_argument("-v", "--verbose", action="store_true", help="実行する git コマンドを表示")
@@ -398,7 +533,7 @@ def main():
     dry_run = args.dry_run or cfg.get("dry_run", False)
 
     log("=" * 70)
-    log(f"git-sync 開始  config={os.path.abspath(args.config)}"
+    log(f"git-sync 開始  config={' + '.join(cfg['_sources'])}"
         + ("  [DRY-RUN]" if dry_run else ""))
 
     git = Git(cfg["work_dir"], cfg.get("merge_identity"), args.verbose)
