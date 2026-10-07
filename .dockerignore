@@ -1,0 +1,10 @@
+.git
+.gitignore
+.gitattributes
+.env
+.env.*
+work_repo/
+logs/
+git_sync.json
+*.bat
+__pycache__/

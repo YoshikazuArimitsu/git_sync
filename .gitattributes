@@ -1,0 +1,6 @@
+# コンテナ内で動くファイルは必ず LF (CRLF だと /bin/sh^M エラーになる)
+*.sh               text eol=lf
+Dockerfile         text eol=lf
+docker-compose.yml text eol=lf
+.dockerignore      text eol=lf
+*.py               text eol=lf

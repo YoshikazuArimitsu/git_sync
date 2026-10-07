@@ -10,6 +10,8 @@ Python 3.8 以上と git があれば動きます（追加ライブラリ不要�
 | `git_sync.py` | 同期スクリプト本体 |
 | `git_sync.sample.json` | 設定ファイルのサンプル |
 | `git_sync.bat` | Windows 用の起動バッチ（ダブルクリック／タスクスケジューラ用） |
+| `Dockerfile` / `entrypoint.sh` | Docker イメージ |
+| `docker-compose.yml` / `.env.sample` | docker compose 用の定義と環境変数サンプル |
 
 ## セットアップ
 
@@ -23,6 +25,92 @@ Python 3.8 以上と git があれば動きます（追加ライブラリ不要�
 python git_sync.py --dry-run
 python git_sync.py
 ```
+
+## Docker で動かす
+
+### いちばん簡単な方法（docker compose）
+
+```
+copy git_sync.sample.json git_sync.json   # 設定を書く
+copy .env.sample .env                     # 必要なら SSH 鍵の場所やトークンを書く
+docker compose up -d --build              # 10 分ごとに同期（常駐）
+docker compose logs -f                    # ログを見る
+```
+
+1 回だけ実行したいとき：
+
+```
+docker compose run --rm -e GIT_SYNC_INTERVAL=0 git-sync            # 本番
+docker compose run --rm -e GIT_SYNC_INTERVAL=0 git-sync --dry-run  # 確認だけ
+```
+
+`git_sync.py` のオプション（`--dry-run`、`-b` など）は、そのままコンテナの引数として渡せます。
+
+### コンテナ内のパス
+
+| パス | 内容 | 渡し方 |
+|---|---|---|
+| `/config/git_sync.json` | 設定ファイル | 読み取り専用でマウント |
+| `/ssh` | SSH 鍵・`config`・`known_hosts` | 読み取り専用でマウント（中でコピーして権限を直すので、Windows の `.ssh` をそのままマウントして OK） |
+| `/data` | 作業リポジトリ・同期状態・ログ・known_hosts | **ボリュームで永続化**（消すと削除検知が初回扱いに戻る） |
+
+コンテナ内では `work_dir` は `/data/work_repo`、`log_file` は `/data/logs/git_sync.log` に固定されます（設定ファイルの値より優先）。
+
+### 設定の渡し方（3通り・組み合わせ可）
+
+後に書いたものほど優先されます。
+
+**1. 設定ファイルをマウントする**（おすすめ）
+
+```
+docker run --rm -v %CD%\git_sync.json:/config/git_sync.json:ro -v %USERPROFILE%\.ssh:/ssh:ro -v git-sync-data:/data git-sync
+```
+
+置き場所を変えたいときは `GIT_SYNC_CONFIG=/path/to/file.json` で指定できます。
+
+**2. 設定 JSON を環境変数でまるごと渡す**（CI や Kubernetes の Secret 向け）
+
+```
+docker run --rm -e GIT_SYNC_CONFIG_JSON="{\"remotes\":[...]}" ... git-sync
+```
+
+ファイルと併用した場合は、JSON に書いたキーだけが上書きされます。
+
+**3. 個別の環境変数で渡す・上書きする**
+
+| 環境変数 | 対応する設定 | 例 |
+|---|---|---|
+| `GIT_SYNC_REMOTES` | `remotes` | `origin=git@github.com:you/a.git,sub=git@github.com:you/b.git` |
+| `GIT_SYNC_DRY_RUN` | `dry_run` | `true` |
+| `GIT_SYNC_ON_CONFLICT` | `on_conflict` | `prefer:origin` |
+| `GIT_SYNC_SYNC_TAGS` | `sync_tags` | `true` |
+| `GIT_SYNC_INCLUDE_BRANCHES` / `GIT_SYNC_EXCLUDE_BRANCHES` | `include_branches` / `exclude_branches` | `feature/*,tmp/*` |
+| `GIT_SYNC_DELETE_MERGED` / `GIT_SYNC_REQUIRE_MERGED` | `delete_merged_branches.enabled` / `.require_merged` | `false` |
+| `GIT_SYNC_MERGE_NAME` / `GIT_SYNC_MERGE_EMAIL` | `merge_identity` | |
+| `GIT_SYNC_WORK_DIR` / `GIT_SYNC_LOG_FILE` | `work_dir` / `log_file`（`none` でファイル出力なし） | |
+
+`GIT_SYNC_REMOTES` だけ渡せば、設定ファイル無しでも動きます。
+
+### コンテナの動作を変える環境変数
+
+| 環境変数 | 説明 | 既定値 |
+|---|---|---|
+| `GIT_SYNC_INTERVAL` | 同期の間隔（秒）。`0` で 1 回実行して終了 | `0`（compose では `600`） |
+| `GIT_SSH_PRIVATE_KEY` | SSH 秘密鍵の**中身**（`/ssh` をマウントしない場合） | なし |
+| `GIT_SYNC_SSH_STRICT` | ホスト鍵の確認：`accept-new`（初回は自動登録）/ `yes` / `no` | `accept-new` |
+| `TZ` | ログの時刻のタイムゾーン | `Asia/Tokyo` |
+
+### 認証情報（トークン）の扱い
+
+設定ファイルの URL には `${環境変数名}` と書けます。実行時に環境変数の値に置き換わるので、トークンを設定ファイルに書かずに済みます。
+
+```json
+{ "name": "github", "url": "https://x-access-token:${GITHUB_TOKEN}@github.com/you/repo.git" }
+```
+
+`.env` に `GITHUB_TOKEN=...` と書いておけば compose から渡されます。ログ上では `https://***@github.com/...` と伏せ字になります。未定義の変数を参照していると、実行前にエラーで止まります。
+
+> ※ `/ssh` にマウントした `config` に `IdentityFile C:\Users\...` のような Windows のパスが書かれていると、コンテナ内では見つかりません。`~/.ssh/id_ed25519` のような書き方にしてください。
 
 ## 設定項目
 
@@ -99,4 +187,5 @@ python git_sync.py [-c 設定ファイル] [-n] [-b ブランチ ...] [-v]
 - 削除検知は「前回の同期状態」と比べて行うため、**初回実行では動きません**（2回目から有効）。状態は `work_dir/.git/git_sync_state.json` に保存されます。リモート構成を変えた直後の1回も削除検知を行いません。
 - fetch できないリモートが 1 つでもあると、誤って「ブランチが無い」と判断しないよう、全体を中止します。
 - `work_dir` はスクリプト専用です。中で手作業をしないでください（実行時に作業ツリーをリセットします）。
-- 定期実行する場合は Windows のタスクスケジューラで `git_sync.bat` を登録してください。
+- 定期実行する場合は Windows のタスクスケジューラで `git_sync.bat` を登録するか、Docker の常駐モード（`GIT_SYNC_INTERVAL`）を使ってください。
+- **Windows ローカル実行と Docker を同じリモートに対して同時に動かさないでください。** 作業リポジトリと同期状態が別々になるため、片方が削除したブランチをもう片方が復元するなど、動作が干渉します。

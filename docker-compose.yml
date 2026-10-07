@@ -1,0 +1,26 @@
+services:
+  git-sync:
+    build: .
+    image: git-sync:latest
+    container_name: git-sync
+    restart: unless-stopped
+    environment:
+      # 何秒ごとに同期するか (0 にすると 1 回だけ実行して終了)
+      GIT_SYNC_INTERVAL: "600"
+      TZ: Asia/Tokyo
+      # HTTPS のトークンを使う場合は .env に書き、URL 側で ${GITHUB_TOKEN} のように参照する
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      # 設定ファイルを使わずに環境変数だけで渡すことも可能 (README 参照)
+      # GIT_SYNC_REMOTES: "origin=git@github.com:you/a.git,sub=git@github.com:you/b.git"
+      # GIT_SYNC_DRY_RUN: "true"
+    volumes:
+      # 設定ファイル (読み取り専用)
+      - ${GIT_SYNC_CONFIG_FILE:-./git_sync.json}:/config/git_sync.json:ro
+      # SSH 鍵 (読み取り専用。コンテナ内でコピーして権限を直す)
+      - ${SSH_DIR:-~/.ssh}:/ssh:ro
+      # 作業リポジトリ・同期状態・ログ (削除検知のため永続化が必要)
+      - git-sync-data:/data
+
+volumes:
+  git-sync-data:
